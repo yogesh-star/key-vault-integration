@@ -1,0 +1,110 @@
+#!/bin/bash
+​
+rg=terraforminfraresourcegroup
+clustername=test-test-aks
+az account set --subscription 128ad154-90cf-44db-8c48-4824c5a6fb01
+az group create --name $rg --location eastus
+az aks create --resource-group $rg --name $clustername --node-count 1 --generate-ssh-keys --enable-managed-identity --network-plugin kubenet
+az aks get-credentials --resource-group $rg --name $clustername --overwrite
+az keyvault create --name "vault8960677" --resource-group "$rg" --location eastus
+az keyvault secret set --vault-name "vault8960677" --name "ExamplePassword" --value "hVFkk965BuUv"
+helm repo add csi-secrets-store-provider-azure https://raw.githubusercontent.com/Azure/secrets-store-csi-driver-provider-azure/master/charts
+helm install csi-secrets-store-provider-azure/csi-secrets-store-provider-azure --generate-name --set secrets-store-csi-driver.syncSecret.enabled=true
+kubectl get pods
+clientId=`az aks show --name ${clustername} --resource-group ${resource-group} |jq -r .identityProfile.kubeletidentity.clientId`
+nodeResourceGroup=`az aks show --name $clustername --resource-group $rg |jq -r .nodeResourceGroup` 
+subId=`az account show | jq -r .id`
+az role assignment create --role "Managed Identity Operator" --assignee $clientId --scope /subscriptions/$subId/resourcegroups/$rg
+az role assignment create --role "Managed Identity Operator" --assignee $clientId --scope /subscriptions/$subId/resourcegroups/$nodeResourceGroup
+az role assignment create --role "Virtual Machine Contributor" --assignee $clientId --scope /subscriptions/$subId/resourcegroups/$nodeResourceGroup
+helm repo add aad-pod-identity https://raw.githubusercontent.com/Azure/aad-pod-identity/master/charts
+helm install pod-identity aad-pod-identity/aad-pod-identity --set nmi.allowNetworkPluginKubenet=true
+az identity create -g $rg -n aks2kvIdentity
+clientId=`az identity show --name aks2kvIdentity --resource-group $rg |jq -r .clientId`
+principalId=`az identity show --name aks2kvIdentity --resource-group $rg |jq -r .principalId`
+subId=`az account show | jq -r .id`
+az role assignment create --role "Reader" --assignee $principalId --scope /subscriptions/$subId/resourceGroups/secure-keyvault/providers/Microsoft.KeyVault/vaults/keyvault-test
+az keyvault set-policy -n keyvault-test --secret-permissions get --spn $clientId
+az keyvault set-policy -n keyvault-test --key-permissions get --spn $clientId
+​
+cat << EOF | kubectl apply -f -
+apiVersion: aadpodidentity.k8s.io/v1
+kind: AzureIdentity
+metadata:
+  name: "aks-kv-identity1"               
+spec:
+  type: 0                                 
+  resourceID: /subscriptions/bf32e340-5493-4f67-bf07-a976e2fe49ff/resourcegroups/MyResourceGroup/providers/Microsoft.ManagedIdentity/userAssignedIdentities/aks2kvIdentity
+  clientID: "2f611e29-9f9a-4816-8934-3db852a3e738"
+---
+apiVersion: aadpodidentity.k8s.io/v1
+kind: AzureIdentityBinding
+metadata:
+  name: azure-pod-identity-binding
+spec:
+  azureIdentity: "aks-kv-identity1"      
+  selector: azure-pod-identity-binding-selector
+EOF
+​
+TENANT=`az keyvault show -n keyvault-test | grep tenantId`
+​
+cat << EOF | kubectl apply -f -
+apiVersion: secrets-store.csi.x-k8s.io/v1alpha1
+kind: SecretProviderClass
+metadata:
+  name: spc-myk8skv1
+spec:
+  provider: azure
+  secretObjects:
+  - secretName: jwt-secrets
+    data:
+    - key: jwtkey
+      objectName: ExamplePassword
+    type: Opaque
+  parameters:
+    usePodIdentity: "true"                                      
+    useVMManagedIdentity: "false"                               
+    userAssignedIdentityID: ""                                                                                                
+    keyvaultName: "vaultyv"                                                                
+    cloudName: ""                                               
+    objects:  |
+      array:
+        - |
+          objectName: ExamplePassword                      
+          objectType: secret                                    
+          objectVersion: ""                                     
+    resourceGroup: "MyResourceGroup"                      
+    subscriptionId: "bf32e340-5493-4f67-bf07-a976e2fe49ff"      
+    tenantId: "79061fd6-8424-42f9-92e6-aed843caedcd"
+EOF
+​
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inject-secrets-from-akv
+  labels:
+    aadpodidbinding: azure-pod-identity-binding-selector
+  
+spec:
+  containers:
+    - name: nginx
+      image: nginx
+      env:
+      - name: SECRET
+        valueFrom:
+          secretKeyRef:
+            name: jwt-secrets
+            key: jwtkey
+      volumeMounts:
+        - name: secrets-store-inline1
+          mountPath: "/mnt/secrets-store"
+          readOnly: true
+  volumes:
+    - name: secrets-store-inline1
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: spc-myk8skv1
+EOF
